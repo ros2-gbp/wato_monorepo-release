@@ -1,0 +1,12 @@
+Source: ros-jazzy-eidos-msgs
+Section: misc
+Priority: optional
+Maintainer: "WATonomous" <infra@watonomous.ca>
+Build-Depends: debhelper (>= 9.0.0), ros-jazzy-ament-cmake, ros-jazzy-geometry-msgs, ros-jazzy-rosidl-default-generators, ros-jazzy-std-msgs, ros-jazzy-ros-workspace, ros-jazzy-rosidl-typesupport-fastrtps-c, ros-jazzy-rosidl-typesupport-fastrtps-cpp
+Homepage: https://index.ros.org/p/eidos_msgs/#jazzy
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-eidos-msgs
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-geometry-msgs, ros-jazzy-rosidl-default-runtime, ros-jazzy-std-msgs, ros-jazzy-ros-workspace
+Description: Message and service definitions for the eidos SLAM system
