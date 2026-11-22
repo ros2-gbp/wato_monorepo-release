@@ -1,492 +1,471 @@
-# Developer Guidelines for the Eve Monorepo
+# Eidos Developer Guide
 
-## watod
+## 1. System Overview
 
-`watod` is a wrapper script around `docker compose` that manages the monorepo's development environment. It automatically handles environment variables, compose files, and service configuration.
+Eidos is a plugin-based SLAM and localization system built as a ROS 2 lifecycle node.
+It uses GTSAM's ISAM2 for incremental factor graph optimization. Plugins provide
+sensor-specific factors, relocalization strategies, and visualization. Eidos is
+pure SLAM -- it does not broadcast TF or run an EKF. TF broadcasting and odometry
+fusion are handled by the separate `eidos_transform` package.
 
-### Installation (Optional)
-To run watod from anywhere in your computer, you can install `watod` by running:
+```
+                         EidosNode (LifecycleNode)
+                         ========================
+                         |                      |
+        tick() @ slam_rate_ Hz          services: save_map / load_map
+                         |
+          +--------------+----------------+
+          |              |                |
+    InitSequencer    GraphOptimizer      PluginRegistry
+    (state machine)  (ISAM2 engine) (owns all plugins + ClassLoaders)
+          |              |                |
+          |              |     +----------+----------+-----------+
+          |              |     |          |                      |
+          |              |   Factor    Relocalization      Visualization
+          |              |   Plugins   Plugins             Plugins
+          |              |
+          |            MapManager
+          |            (keyframe poses + data,
+          |             SQLite persistence)
+
+Data flow (per SLAM tick):
+  Sensor callbacks --> FactorPlugin buffers (lock-free)
+  SLAM tick        --> poll plugins for factors --> GraphOptimizer.optimize()
+  GraphOptimizer        --[LockFreePose]--> published slam/pose topic
+  GraphOptimizer        --[AtomicSlot<Values>]--> VisualizationPlugins (reads lock-free)
+  GraphOptimizer        --> MapManager.updatePoses()
+```
+
+## 2. Core Components
+
+### EidosNode
+
+Top-level lifecycle node that owns all core components: `GraphOptimizer`, `InitSequencer`,
+`MapManager`, and `PluginRegistry`. It drives the SLAM loop via a timer at `slam_rate_`
+Hz. Each tick delegates to `InitSequencer` until `TRACKING` is reached, then calls
+`handleTracking()` which polls factor plugins, feeds factors to `GraphOptimizer`, and
+publishes pose/odometry. Exposes `save_map` and `load_map` ROS services. Shares a
+`tf2_ros::Buffer` with plugins for extrinsic lookups (static transforms from URDF).
+
+Does not broadcast TF. Publishes `slam/pose` which `eidos_transform` subscribes to
+for TF updates.
+
+### GraphOptimizer
+
+ISAM2 optimization engine. Has no orchestration logic -- `EidosNode` tells it when to
+optimize. Maintains a monotonic state timeline (`Symbol('x', N)`). After each
+`optimize()` call, it writes the latest optimized pose to a `LockFreePose` and the
+full optimized `Values` to an `AtomicSlot` (read by visualization plugins). Provides
+extra convergence iterations after loop closure or GPS corrections (via the
+`extra_iterations` parameter to `optimize()`). Configured via `configure(logger,
+relinearize_threshold, relinearize_skip, prior_pose_cov)`. Key methods: `configure()`,
+`reset()`, `optimize()`, `createState()`, `getPose()`, `getCovariance()`.
+
+After optimization, `EidosNode` calls `onOptimizationComplete(values, graph_corrected)`
+on every factor plugin. The `graph_corrected` bool is true when a loop closure or
+correction factor was present (i.e., `StampedFactorResult::loop_closure ||
+StampedFactorResult::correction`). Plugins use this to decide whether to re-anchor
+internal state (e.g., LISO triggers a submap rebuild when `graph_corrected` is true).
+
+### MapManager
+
+Centralized keyframe pose and data store. At runtime, all per-keyframe and global data
+lives in memory as `std::any`, accessed via typed `store<T>()`/`retrieve<T>()` templates.
+Manages keyframe 3D/6D point clouds and a KD-tree for spatial queries. Tracks graph
+adjacency (edges between keyframes). For persistence, uses a single SQLite `.map` file.
+Plugins register data formats via `registerKeyframeFormat()` and `registerGlobalFormat()`,
+linking data keys to named format handlers from the shared format registry. Has a
+`configure(logger)` method that must be called once to provide the ROS logger.
+`addKeyframe()` requires an `owner` plugin name (no default). Key methods:
+`configure()`, `addKeyframe()`, `updatePoses()`, `store<T>()`/`retrieve<T>()`,
+`storeGlobal<T>()`/`retrieveGlobal<T>()`, `saveMap()`, `loadMap()`.
+
+### PluginRegistry
+
+Loads, owns, and provides lookup for all plugins. Uses `pluginlib::ClassLoader` for
+each plugin category: factor plugins, relocalization plugins, and visualization plugins.
+Loading happens once during `EidosNode::on_configure()`. After loading, the registry
+is read-only. Other components hold `const` pointers for lock-free plugin lookups.
+Plugin collections are public for read access: `factor_plugins`, `reloc_plugins`,
+`vis_plugins`. Provides `findFactor(name)` for named lookup.
+
+### InitSequencer
+
+Manages the `INIT -> WARMING_UP -> RELOCALIZING -> TRACKING` state machine, separated
+from `EidosNode` so orchestration logic stays clean. Receives an rclcpp logger via
+`configure()` for status messages. `EidosNode` calls `step()` each
+SLAM tick. In `WARMING_UP`, the sequencer polls all factor plugins' `isReady()` each
+tick and will not proceed until every plugin reports ready (e.g. LisoFactor and ImuFactor
+both gate on IMU warmup -- stationary detection and gravity alignment). Once all plugins are ready:
+if a prior map is loaded, it transitions to `RELOCALIZING` and polls relocalization
+plugins; if no prior map, it transitions directly to `TRACKING` with an identity pose.
+Once a relocalization result is obtained (or the timeout expires), it invokes the
+`on_tracking` callback which triggers `EidosNode::beginTracking()`. Only called from
+the SLAM loop thread.
+
+### Key Data Types
+
+**`StampedFactorResult`** (`utils/types.hpp`): Return type for `produceFactor()` and
+`latchFactor()`. Fields:
+- `timestamp` (`std::optional<double>`): If set, EidosNode creates a new ISAM2 state at
+  this sensor time. If nullopt, factors are latched onto an existing state.
+- `factors`: Vector of GTSAM factors to add to the graph.
+- `values`: Initial value estimates for any new variables.
+- `loop_closure` (`bool`): When true, the optimizer runs extra loop closure iterations.
+- `correction` (`bool`): When true (and `loop_closure` is false), extra correction
+  iterations run (e.g. GPS unary factor).
+
+**`NewState`** (namespace-level struct in `core/eidos_node.hpp`): Collects the output of
+a `produceFactor()` call that created a new state. Fields: `key`, `ts` (sensor timestamp),
+`result` (the `StampedFactorResult`), and `owner` (plugin name).
+
+## 3. Threading Model
+
+Eidos uses a multi-threaded executor. Each component has its own callback group to
+allow concurrent execution where safe.
+
+### SLAM Loop (configurable, typically 10 Hz)
+
+- Own `MutuallyExclusive` callback group (`slam_callback_group_`).
+- The `tick()` timer fires at `slam_rate_` Hz.
+- Processes all factor plugins synchronously in a single tick (polls each for factors,
+  feeds to GraphOptimizer, runs ISAM2 optimization).
+- Writes to `LockFreePose` and `AtomicSlot<Values>` after optimization.
+- Calls `MapManager::updatePoses()` and `MapManager::addKeyframe()`.
+- Publishes `slam/pose` and `slam/odometry`.
+
+### Visualization Plugins (typically 1 Hz each)
+
+- Each visualization plugin has its own callback group and timer.
+- Reads `AtomicSlot<Values>` from GraphOptimizer (pointer-swap read).
+- Reads from `MapManager` (mutex-protected).
+- Independent of SLAM loop timing.
+
+### Plugin Sensor Callbacks
+
+- Each plugin has its own callback group for ROS subscriptions.
+- Sensor data arrives concurrently with the SLAM loop.
+- Plugins buffer data internally and expose it via lock-free getters
+  (e.g., `getOdomPose()` returns from a `LockFreePose`).
+- The SLAM loop polls plugins via `produceFactor()` without contention.
+
+```
+Thread 1 (SLAM loop @ 10 Hz):
+  tick() -> poll plugins -> GraphOptimizer::optimize()
+         -> LockFreePose.store()
+         -> AtomicSlot<Values>.store()   --> [read by Thread 2..N]
+         -> MapManager::updatePoses()
+         -> publish slam/pose, slam/odometry
+
+Thread 2..N (Visualization plugins @ 1 Hz each):
+  timer -> AtomicSlot<Values>.load() [pointer swap]
+        -> MapManager reads [mutex]
+        -> publish
+
+Thread M..Z (Plugin sensor callbacks):
+  subscription callback -> buffer data internally
+                        -> LockFreePose.store() for odom/map pose
+```
+
+## 4. Lock-Free Data Flow
+
+### LockFreePose (seqlock)
+
+Single-writer, multi-reader lock-free storage for `gtsam::Pose3` (~100 bytes).
+Uses a seqlock pattern: the writer increments an atomic sequence counter to odd before
+writing and back to even after. A reader that observes an odd counter (writer active)
+retries. Since the copy takes nanoseconds, readers effectively never block.
+
+Usage points:
+- **GraphOptimizer -> EidosNode**: GraphOptimizer writes `optimized_pose_` after each
+  `optimize()` call. EidosNode reads it to publish `slam/pose`.
+- **Plugin -> EidosNode**: Factor plugins write their odom-frame and map-frame poses
+  from sensor callbacks via `setOdomPose()`/`setMapPose()`. These are available for
+  internal pose sharing between plugins within eidos (e.g., for cross-plugin state
+  bridging via `MotionModelFactor`).
+
+### AtomicSlot (pointer swap)
+
+Single-writer, multi-reader slot for large payloads. The writer creates a new
+`shared_ptr<const T>` and swaps it in under a brief mutex. Readers get the latest
+snapshot as a `shared_ptr<const T>`.
+
+Usage points:
+- **GraphOptimizer -> VisualizationPlugins**: GraphOptimizer writes `optimized_values_`
+  (full `gtsam::Values`) after each optimization. Visualization plugins read via
+  `load()` to render the pose graph.
+
+### Plugin Pose Slots
+
+Factor plugins expose `getOdomPose()` and `getMapPose()` returning
+`std::optional<gtsam::Pose3>` via their own `LockFreePose` instances. The plugin's
+sensor callback thread writes. No mutex contention on the hot path. These are used
+for lock-free pose sharing within eidos -- not for TF broadcasting (which is handled
+by `eidos_transform`).
+
+## 5. State Machine
+
+```
+  +----------------+
+  | INITIALIZING   |  Node created, not yet configured/activated.
+  +-------+--------+
+          |
+          |  on_activate() -> InitSequencer::reset()
+          v
+  +----------------+
+  | WARMING_UP     |  Polling isReady() on all factor plugins each tick.
+  +-------+--------+
+          |
+          +--- any plugin !isReady() ---> stay in WARMING_UP
+          |
+          +--- all plugins ready, no prior map ---> on_tracking(Identity)
+          |
+          +--- all plugins ready, prior map loaded:
+          v
+  +----------------+
+  | RELOCALIZING   |  Polling relocalization plugins each tick.
+  +-------+--------+
+          |
+          +--- reloc plugin returns a pose ---> on_tracking(reloc_pose)
+          |
+          +--- timeout (configurable) -------> on_tracking(Identity)
+          v
+  +----------------+
+  | TRACKING       |  SLAM loop active. GraphOptimizer running.
+  +----------------+
+```
+
+**Transition triggers:**
+
+- `INITIALIZING -> WARMING_UP`: `EidosNode::on_activate()` calls `InitSequencer::reset()`.
+- `WARMING_UP -> TRACKING`: All factor plugins report `isReady() == true` and no prior
+  map is loaded. `on_tracking` callback is invoked with `Pose3::Identity()`.
+- `WARMING_UP -> RELOCALIZING`: All factor plugins report `isReady() == true` and a
+  prior map is loaded (`map_manager_->hasPriorMap()`).
+- `RELOCALIZING -> TRACKING`: A relocalization plugin returns a valid pose via
+  `tryRelocalize()`, or the relocalization timeout expires (falls back to identity pose).
+  `on_tracking` callback is invoked with the resulting pose.
+
+The `on_tracking` callback triggers `EidosNode::beginTracking()`, which resets the
+GraphOptimizer and notifies all factor plugins via `onTrackingBegin()`.
+
+## 6. Map Persistence
+
+Maps are stored as single SQLite `.map` files. The file is self-describing: a
+`data_formats` table records which serialization format each data key uses, so external
+tools can deserialize without external knowledge. The [`eidos_tools`](../eidos_tools/README.md)
+package provides the `eidos` CLI for inspecting maps, dumping poses, building PCD exports,
+and viewing graph structure.
+
+### SQLite Schema
+
+```sql
+-- Key-value metadata (version, num_states, etc.)
+CREATE TABLE metadata (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+
+-- Keyframe poses (6-DOF + timestamp + owner plugin)
+CREATE TABLE keyframes (
+  id        INTEGER PRIMARY KEY,
+  gtsam_key INTEGER UNIQUE,
+  x REAL, y REAL, z REAL,
+  roll REAL, pitch REAL, yaw REAL,
+  time REAL,
+  owner TEXT
+);
+
+-- Per-keyframe binary data blobs (point clouds, descriptors, etc.)
+CREATE TABLE keyframe_data (
+  gtsam_key INTEGER,
+  data_key  TEXT,
+  data      BLOB,
+  PRIMARY KEY (gtsam_key, data_key)
+);
+
+-- Global binary data blobs (e.g., SC matrix for loop closure)
+CREATE TABLE global_data (
+  data_key TEXT PRIMARY KEY,
+  data     BLOB
+);
+
+-- Factor graph edges between keyframes
+CREATE TABLE edges (
+  key_a INTEGER,
+  key_b INTEGER,
+  owner TEXT,
+  PRIMARY KEY (key_a, key_b)
+);
+
+-- Self-describing format registry (maps data keys to format handlers)
+CREATE TABLE data_formats (
+  data_key TEXT PRIMARY KEY,
+  format   TEXT,
+  scope    TEXT   -- "keyframe" or "global"
+);
+```
+
+### Format Registry Pattern
+
+Serialization is handled by a shared format registry (`eidos::formats::registry()`).
+Each format is a subclass of `eidos::formats::Format` providing `serialize(std::any) ->
+bytes` and `deserialize(bytes) -> std::any`. The registry is a global map from format
+name (e.g., `"pcl_pcd_binary"`) to `Format` instance. Both `eidos` and `eidos_tools`
+link the same registry.
+
+### How Plugins Register Formats
+
+During initialization, each plugin that persists data calls:
+
+```cpp
+map_manager->registerKeyframeFormat("my_plugin/cloud", "pcl_pcd_binary");
+map_manager->registerGlobalFormat("my_plugin/global_descriptor", "eigen_binary");
+```
+
+This tells `MapManager` that when saving, the `std::any` stored under key
+`"my_plugin/cloud"` should be serialized using the `"pcl_pcd_binary"` format handler.
+The `data_formats` table records this mapping so that loading can find the correct
+deserializer without any compile-time coupling to specific plugins.
+
+**Type contract**: The `std::any` stored via `store()` for a given `data_key` must
+contain the C++ type that the named format expects (e.g., `"pcl_pcd_binary"` expects
+`pcl::PointCloud<PointType>::Ptr`). A mismatch causes `std::bad_any_cast` at save time,
+which is caught and logged.
+
+### Adding a New Format
+
+To persist a new C++ type through the map file:
+
+1. **Create the format handler** in `include/eidos/map/`. Inherit `eidos::formats::Format`
+   and implement `serialize` / `deserialize`:
+
+```cpp
+// include/eidos/map/my_type_binary.hpp
+#pragma once
+#include <cstring>
+#include "eidos/map/format.hpp"
+
+namespace eidos::formats {
+
+class MyTypeBinary : public Format {
+public:
+  std::vector<uint8_t> serialize(const std::any & data) override {
+    auto val = std::any_cast<MyType>(data);       // throws bad_any_cast on wrong type
+    std::vector<uint8_t> buf(sizeof(MyType));
+    std::memcpy(buf.data(), &val, sizeof(MyType));
+    return buf;
+  }
+
+  std::any deserialize(const std::vector<uint8_t> & bytes) override {
+    if (bytes.size() < sizeof(MyType)) return std::any{};
+    MyType val;
+    std::memcpy(&val, bytes.data(), sizeof(MyType));
+    return val;
+  }
+};
+
+} // namespace eidos::formats
+```
+
+1. **Register the format** in `src/format_registry.cpp`:
+
+```cpp
+#include "eidos/map/my_type_binary.hpp"
+
+// Inside the registry() lambda:
+r["my_type_binary"] = std::make_unique<MyTypeBinary>();
+```
+
+1. **Use the format in your plugin**. During `onInitialize()`, register the data key
+   with MapManager so save/load knows which format to use:
+
+```cpp
+void MyPlugin::onInitialize() {
+  // For per-keyframe data:
+  map_manager_->registerKeyframeFormat("my_plugin/data", "my_type_binary");
+
+  // For global (non-keyframe) data:
+  map_manager_->registerGlobalFormat("my_plugin/config", "my_type_binary");
+}
+```
+
+1. **Store/retrieve data** at runtime using the typed templates:
+
+```cpp
+// Store (in sensor callback or produceFactor):
+map_manager_->store<MyType>(gtsam_key, "my_plugin/data", value);
+
+// Retrieve (in onTrackingBegin or submap build):
+auto val = map_manager_->retrieve<MyType>(gtsam_key, "my_plugin/data");
+if (val) { /* use *val */ }
+```
+
+The format is now automatically serialized during `saveMap()` and deserialized during
+`loadMap()`. The `data_formats` table records the mapping so `eidos_tools` and any
+future reader can deserialize without knowing about your plugin.
+
+**Existing formats** for reference:
+
+| Format Name | C++ Type | Size | Header |
+|---|---|---|---|
+| `pcl_pcd_binary` | `pcl::PointCloud<PointType>::Ptr` | N *sizeof(PointXYZI) | `pcl_pcd_binary.hpp` |
+| `small_gicp_binary` | `small_gicp::PointCloud::Ptr` | 8 + N* 32 bytes | `small_gicp_binary.hpp` |
+| `raw_double3` | `gtsam::Point3` (Eigen::Vector3d) | 24 bytes | `raw_double3.hpp` |
+| `raw_double4_eigen` | `Eigen::Vector4d` | 32 bytes | `raw_double4_eigen.hpp` |
+| `raw_double5` | `std::array<double, 5>` | 40 bytes | `raw_double5.hpp` |
+
+### Save / Load Flow
+
+- **Save** (`saveMap(path)`): Opens a new SQLite file. Writes metadata, keyframe poses,
+  serialized keyframe data blobs, global data blobs, edges, and format mappings in a
+  single transaction. Uses WAL journal mode.
+- **Load** (`loadMap(path)`): Opens the SQLite file read-only. Clears existing state.
+  Loads keyframe poses immediately. Reads the `data_formats` table to discover which
+  format handles each data key, then deserializes all keyframe and global data blobs
+  using the format registry. Loaded keyframes are tracked as prior map keys
+  (`prior_map_keys_`) so the system can distinguish them from newly created keyframes.
+
+## 7. Replaying Old Bags Without EIDOS Topics
+
+If you have a rosbag that was recorded before EIDOS was running (no `slam/pose` or
+`slam/odometry`), you can run EIDOS live alongside playback and it will process the
+raw sensor data from the bag in real time.
+
+**Requirements** — the bag must contain:
+- `/lidar_cc/velodyne_points` (LiSO factor)
+- `/novatel/oem7/imu/data`
+- `/novatel/oem7/fix` (GPS factor)
+
+**Steps:**
 
 ```bash
-./watod install
+# Start interfacing + world_modeling in dev mode (also brings up infrastructure)
+./watod -m interfacing:dev world_modeling:dev up -d
+
+# Play the bag with sim time
+./watod bag play <bag_name> --clock
+
+# Verify EIDOS is publishing pose estimates
+./watod -t world_modeling_bringup
+ros2 topic echo /world_modeling/slam/pose
 ```
 
-Otherwise, you can run `watod` as just `./watod` when you are under the `wato_monorepo/` directory.
+EIDOS will go through its normal `WARMING_UP -> TRACKING` state machine as it
+receives data from the bag. Allow a few seconds for IMU warmup before pose
+estimates appear.
 
-### Usage
+## 8. Troubleshooting
 
-For current usage and all available options:
+### Memory growth across restarts
+
+If RAM usage grows after repeatedly restarting eidos (or any ROS 2 node using `rmw_zenoh_cpp`), the cause is stale zenoh shared memory segments in `/dev/shm/`. Zenoh allocates shared memory for inter-process communication but does not clean up segments when processes are killed.
+
+To fix: stop all containers, then clear the segments:
 
 ```bash
-watod --help
+watod down all
+rm -f /dev/shm/*.zenoh
 ```
 
-**Important Features:**
-- **Service management**: Start, stop, and manage Docker containers (`watod up`, `watod down`, `watod ps`)
-- **Terminal access**: Open shells in running containers with `-t` flag (`watod -t perception_bringup_dev`)
-  - Note: for full DevContainer experience, run `watod -t` on a container that is denoted as a `DevContainer`. More information about DevContainers [here](#devcontainers)
-- **Testing**: Run colcon tests across $ACTIVE_MODULES with (`watod test`)
-- **ROS bag management**: Record and play ROS2 bags with automatic mounting (`watod bag <command>`)
-- **VSCode Setup**: Configure local VSCode IntelliSense by extracting headers from containers (`watod -s`)
-
-To configure `watod`, create a `watod-config.local.sh` file next to [`watod-config.sh`](./watod-config.sh). The local file is untracked and overrides the tracked configuration; `watod-config.sh` itself is protected by CI and should not be modified. Set `ACTIVE_MODULES` in `watod-config.local.sh` to choose which docker services to start.
-
-On NVIDIA machines, also set `CUDASM` in `watod-config.local.sh` to match your GPU's compute capability. For example, use `export CUDASM=86` if you have a RTX 30 series or older. Run `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` to check your GPU, and remove the decimal point (`8.6` becomes `86`). After changing `CUDASM`, rebuild with `./watod build`; `watod up --build` does not rebuild the source and dependency pre-build stages.
-
-## Base Images and Docker Registry
-
-WATonomous hosts a docker registry where we store various docker images on the internet. We currently use ghcr.io
-
-```bash
-# BEFORE YOU RUN, you need to create a personal access token with write:packages
-docker login ghcr.io
-# Username: <your github username>
-# Password: <your personal access token>
-```
-
-Theses base images are used in our dockerfiles to provide a starting point for all of our docker images.
-
-ALL WATONOMOUS BASE IMAGES ARE BUILT USING THE WATO_MONOREPO. It is configured [here](.github/include/base_image_config.json), and must be ran manually in GitHub CI (search for the job **Build Monorepo Base Images** under the **Actions** tab). Note, only administrators can trigger new image builds.
-
-### How are the wato_monorepo base images created?
-
-All wato_monorepo base images are created using [GitHub Workflows](https://docs.github.com/en/actions/using-workflows/about-workflows). GitHub Workflows are automated procedures defined in a GitHub repository that can be triggered by various GitHub events, such as a push or a pull request, to perform tasks like building, testing, and deploying code.
-
-### Module Build Caching in CI
-
-CI (`Build and Test Monorepo`) builds each changed module in isolation with `watod build`/`watod test`. To keep PR runs fast, buildkit's registry cache is exported to GHCR (`cache_to` in the CI-only `modules/docker-compose*.ci-cache.yaml` overrides, which `watod_scripts/watod-compose.sh` adds only when `$CI`/`$GITHUB_ACTIONS` is set; refs like `<module image>:ci_cache_source` / `:ci_cache_deps` / `:ci_cache_bringup` / `:ci_cache_test`) and imported back (`cache_from`) on later runs:
-
-- Regular `docker compose push` of the images is NOT enough for caching: images loaded through the docker image store lose buildkit's cache metadata, so `cache_from` on pushed image tags finds no layers. The `ci_cache_*` cache manifests are exported directly by buildkit (`cache_to`), and that is what makes the imports hit.
-- `source`/`deps` stages (apt TensorRT / Isaac ROS installs, upstream git clones) re-execute only when their inputs change — i.e. on base image or Dockerfile changes — not on every branch or commit.
-- `docker/template.Dockerfile`'s `rosdep_scan` stage scans only `package.xml` files, so adding a dependency re-runs it, but source-code edits alone don't.
-- `colcon build`/`colcon test` layers are content-keyed by the copied source, so they still re-run on every commit (that's the remaining non-cacheable core of perception CI, ~8 min).
-
-## DevContainers
-The WATonomous monorepo allows for quick, isolated development using docker containers. This means that you can write and test code without any explicit installations on your own machine except for docker.
-
-To setup a DevContainer:
-1. Append `:dev` to any of the $ACTIVE_MODULES you specify in `watod-config.sh`.
-1. Up containers with `watod up`. Containers denoted as `(DevContainer)` are development environments that you can connect to.
-1. Connect to the DevContainer in one of the following ways:
-
-    1. **Terminal Access** Access a devcontainer through your terminal with `watod -t $DEVCONTAINER_NAME`. Replace `$DEVCONTAINER_NAME` with the name of the container that was denoted as `(DevContainer)` when you ran `watod up`
-    1. **VSCode Access** Install the DevContainer extension on vscode. Then do `Ctrl+Shift+P` and select `Dev Containers: Attach to Running Container...`. Then select the container prepended with `_dev` as the container you want to connect VSCode into.
-
-1. Once you are inside a DevContainer, make sure you work in `/ws/`. All `src` files relevant to the module will be mounted from the monorepo to `/ws/src`. This means that any changes you make in `/ws/src` will reflect out to the `wato_monorepo`. `/ws` is a default ROS2 workspace where you can run commands like `colcon`.
-1. Manage git changes outside of the devcontainer.
-
-## VSCode Setup (Local Development)
-
-If you strictly develop locally (not using DevContainers) but want IntelliSense to work with ROS dependencies, you can use `watod -s`.
-
-```bash
-watod -s [module_name] # defaults to infrastructure if no module specified or "all"
-```
-
-This command:
-1. Starts a temporary container for the specified module
-1. Extracts ROS headers and other dependencies to `/tmp/deps`
-1. Generates/Updates `.vscode/c_cpp_properties.json` and `.vscode/settings.json` to point to these headers
-
-**Note:** You must run this command whenever you switch branches or update dependencies to keep your intellisense up to date.
-
-## Pre-commit
-
-Pre-commit is used to handle all of our code formatting and linting
-
-```bash
-sudo apt-get install -y --no-install-recommends libxml2-utils # for xml linting
-pip install pre‑commit  # if you haven't installed it already
-pre-commit install
-pre-commit run --all-files
-```
-
-## Testing
-
-### Unittesting with wato_test
-All nodes must contain some set of unittests. These can either be testing a node's functions individually, or testing the complete node through IPC in a deterministic way.
-
-We use catch2 tests to do our unittesting. To make the testing process easier to setup. We've introduced a helper library used to test all nodes in the monorepo.
-
-#### To Use
-[wato_test](src/wato_test/) contains a basic CMAKE macro to let you setup a test with the appropriate libraries. It also contains helper nodes to help you test publishers, subscribers, servers, and clients in an event-driven way. Use this package whenever you are setting up tests.
-
-To run tests for all `$ACTIVE_MODULES`, run
-
-```bash
-./watod test
-```
-
-### Playing ROS2 Bags
-
-A bag is a file that stores serialized ROS2 message data. We can play a bag to make data available on various topics.
-More on bags can be found here: https://docs.ros.org/en/humble/Tutorials/Beginner-CLI-Tools/Recording-And-Playing-Back-Data/Recording-And-Playing-Back-Data.html.
-
-#### To Use
-[**Download rosbags for local development here!**](https://drive.google.com/drive/folders/127Kw3o7Org474rkK1wwMDRZKiYHaR0Db)
-
-We expose `ros2 bag` CLI through watod with defaults optimized for high-bandwidth sensor recording:
-- **MCAP format** (efficient columnar storage)
-- **20GB bag splitting** (reduces single-file write pressure)
-- **Compression disabled** (maximizes write throughput for ~1.5 GB/s sensor data)
-
-To enable compression if needed (e.g., for smaller files at the cost of CPU):
-
-```bash
-watod bag record --compression-mode file --compression-format lz4 -a  # LZ4 is fast
-watod bag record --compression-mode file --compression-format zstd -a # zstd is smaller but slower
-```
-
-To view all possible commands, run the following:
-
-```bash
-$ watod bag --help
-usage: ros2 bag [-h]
-                Call `ros2 bag <command> -h` for more detailed usage. ...
-
-Various rosbag related sub-commands
-
-options:
-  -h, --help            show this help message and exit
-
-Commands:
-  convert   Given an input bag, write out a new bag with different settings
-  info      Print information about a bag to the screen
-  list      Print information about available plugins to the screen
-  play      Play back ROS data from a bag
-  record    Record ROS data to a bag
-  reindex   Reconstruct metadata file for a bag
-  to_video  Convert a ROS 2 bag into a video
-
-  Call `ros2 bag <command> -h` for more detailed usage.
-```
-
-`watod bag` manages rosbags located in `$BAG_DIRECTORY` which is a settable directory in `watod-config.sh` and defaults to `$MONO_DIR/bags`. It will create a `$BAG_DIRECTORY/bags/` directory if it doesn't exist.
-
-Some common commands:
-
-```bash
-watod bag ls # lists all bags inside $BAG_DIRECTORY with relative paths
-watod bag record -a -o $BAG_NAME # records all topics, saves in $BAG_DIRECTORY/$BAG_NAME
-watod bag play $BAG_NAME/$BAG_NAME_0.mcap # plays the mcap file located in $BAG_DIRECTORY
-watod bag convert --help # we can do processing on the bags using ros2 bag conversions
-```
-
-If you are using WATcloud, play-only bags exist in:
-
-```bash
-/mnt/wato-drive2/nuscenes_mcap/ros2bags # Nuscenes Data converted into ROSbag format
-/mnt/wato-drive2/rosbags2 # Old rosbag recordings
-```
-
-### Recording with Profiles (`watod run`)
-
-For production recording with preconfigured sensor sets, use `watod run` which launches the rosbag2 recorder as a node with optimized settings.
-
-**Available profiles:**
-
-| Profile | Description |
-|---------|-------------|
-| `all_sensors` | All cameras (rect only), all LiDARs, GPS, IMU |
-| `camera_only` | All cameras (rect only), GPS, IMU (no LiDAR) |
-| `lidar_only` | All LiDARs, GPS, IMU (no cameras) |
-
-**Usage:**
-
-```bash
-watod run all_sensors              # Record with all_sensors profile
-watod run camera_only              # Record cameras only
-watod run lidar_only               # Record LiDARs only
-watod run all_sensors -o my_bag    # Custom output name
-watod run --list                   # List available profiles
-```
-
-**Adding new profiles:**
-
-Create a new YAML file in `src/infrastructure/bag_recorder/config/` following the existing format. The profile will automatically be available via `watod run <profile_name>`.
-
-**Tab completion:**
-
-Tab completion is installed automatically with `watod install`. To enable manually:
-
-```bash
-source ./watod_scripts/watod_completion.bash
-```
-
-## Simulation
-
-Eve uses Carla Simulator for offline tests. See [CARLA_README.md](src/simulation/CARLA_README.md).
-
-## Documentation Guidelines
-
-We follow a by-package mentality for documentation. Every package in the monorepo should contain:
-
-1. `README.md` to discuss general usage
-1. `DEVELOPING.md` to discuss technical specifications and general development patterns of that package
-
-Generally you should:
-- Avoid potential **documentation rot** by reducing documentation that directly refers to implementation details.
-  - **Why?** The implementation could change, and you forget to change the documentation associated with it.
-- Assume users of your package knows ROS2, and also generally how to use the monorepo infrastructure
-- Provide enough information so that anyone knows how hit the ground running.
-- Always keep track of current hacks
-
-We also have the global README.md and DEVELOPING.md as shown to help you navigate around.
-
-## Logging and Viewing Data
-
-`watod up` will startup both a Foxglove Bridge and a Log Viewer.
-
-### Foxglove Bridge
-
-Use the port number to connect to the Foxglove Bridge via the Foxglove Website / App
-
-### Log Viewer
-
-Click the link to bringup a page containing all the logs of each of the containers
-
-> If you are running `watod` on a remote machine, you will have to forward the respective ports to your local machine.
-
-# General Implementation Details
-
-## IPC Middleware
-To facilitate efficient interprocess communication, we utilize the [Zenoh middleware (rmw_zenoh)](https://github.com/ros2/rmw_zenoh/tree/rolling) with [shared memory support](https://zenoh.io/docs/manual/abstractions/#shared-memory).
-
-What this means is, in the context of ROS2 messages, topics are discovered and routed through Zenoh's peer-to-peer protocol, with large messages automatically passed through shared memory for zero-copy data transfer between processes on the same machine.
-
-### Zenoh High-Throughput Tuning
-
-The Zenoh configs in `docker/config/` have been tuned for high-bandwidth sensor data (12 cameras at 1024×1280, 3 LiDARs). Key settings:
-
-| Setting | Default | Tuned | Purpose |
-|---------|---------|-------|---------|
-| `rx.buffer_size` | 64 KB | 16 MB | Reduces fragmentation for ~3.75 MB images |
-| `queue.size.*` | 2 | 8-16 | Handles concurrent sensor publishers |
-| `drop.wait_before_drop` | 1 ms | 10 ms | More time for large message batching |
-| `drop.max_wait_before_drop_fragments` | 50 ms | 200 ms | Accommodates ~60 fragments per image |
-| `tcp.so_rcvbuf/so_sndbuf` | OS default | 16 MB | Larger TCP socket buffers |
-| `shared_memory.pool_size` | 48 MB | 512 MB | Fits 12 cameras with burst headroom |
-
-**Memory impact:** These settings increase memory usage to ~1.5 GB for the router and ~2 GB across all nodes (~3.5 GB total). Requires 16+ GB system RAM.
-
-**Config files:**
-- `docker/config/rmw_zenoh_router_config.json5` - Router settings
-- `docker/config/rmw_zenoh_session_config.json5` - Node/session settings
-
-## ROS2 Intraprocess Communication
-While Zenoh's shared memory support provides efficient zero-copy message passing, we can achieve even faster communication by using [rclcpp_components](https://github.com/ros2/rclcpp/tree/master/rclcpp_components) to form component containers where multiple nodes share the same process.
-
-**Pros**:
-- Message passing is just passing a pointer (no serialization, no data copying at all)
-- Super fast message passing
-**Cons**:
-- All nodes are in one process
-- If one node fails, the whole process fails
-
-Only group your nodes into a component container if you believe that they are tightly coupled and should fail/start as one.
-
-## Adding Dependencies
-**Dependency** any codebase, library, package, that your code depends on.
-
-Dependencies are managed inside a Dockerfile through a variety of tools. When adding external libraries to the wato_monorepo, there are number of ways to do so. The order of methods from best to worst is as follows:
-1. **Installing through ROSdep** ROSdep is a dependency manager from ROS which automatically finds compatible libraries to install for a specific version of ROS. Underthehood, ROSdep uses apt for C++ packages and Pip for python packages. ROSdep dependencies are set inside a ros package's `package.xml`. A `package.xml` has three types of fields:
-   - `<exec_depend>dependency_name</exec_depend>` is used for when your package only needs the dependency at runtime (not during build)
-   - `<test_depend>dependency_name</test_depend>` is used for when your package only needs the dependency at test time
-   - `<build_depend>dependency_name</build_depend>` is used for when your package only needs the dependency at build time
-   - `<depend>dependency_name</depend>` is used for when you package needs the dependency as a whole
-   - This is dangerous as it causes packages to bloat with unneeded dependencies
-
-    To check if the library you want can be installed through ROSdep, you can check [rosdistro](https://github.com/ros/rosdistro). Best way is to clone that repo and Ctrl+F for the package you desire.
-
-1. **Direct `apt` or `pip` installation (not suggested)** You can directly install dependencies in the Dockerfile's `dependencies` stage. This is not recommended as we could run into versioning issues and dockerfile bloat in the future. Also, to make your package open source, you have to make it work with ROSdep. That will heavily increase the odds of your package actually being taken seriously by companies, individuals, research labs, etc.
-
-    **Contribute to opensource! (suggested)** When there doesn't exist a ROSdep key for a given `apt` or `pip` package. Congratulations! You found a quick and easy way to contribute to opensource. To do so:
-
-    1. Fork the https://github.com/ros/rosdistro repository
-    2. Add your package to the appropriate YAML file:
-       - Pip packages → rosdep/python.yaml
-       - System packages → rosdep/base.yaml
-    3. Format for pip packages (in python.yaml):
-
-       ```yaml
-       python3-yourpackage-pip:
-         debian:
-           pip:
-             packages: [yourpackage]
-         fedora:
-           pip:
-             packages: [yourpackage]
-         ubuntu:
-           pip:
-             packages: [yourpackage]
-       ```
-
-```
-4. Submit a Pull Request with:
-   - Links to package listings (PyPI for pip packages,
-  Ubuntu/Debian/Fedora repos for system packages)
-   - Brief description of the package and your use case
-   - Ensure alphabetical ordering
-   - Remove trailing whitespace
-5. Requirements:
-   - Must be in official repos (PyPI main index for pip, official
-  distro repos for apt)
-   - Requires review from 2 people before merging
-   - Typically merged within a week (you can install the dependency as a direct `apt` or `pip` while you wait)
-```
-
-1. **Vendor Package** If the codebase that you want to depend on is not released as a pip or apt dependency, and they ask you to build the codebase from source, then you can create a vendor package of that codebase. To do so, create a package called `<package_name>_vendor`, and then use CMakeLists.txt to build the package using colcon build.
-
-   - **Create CMakeLists.txt**
-
-       ```cmake
-         cmake_minimum_required(VERSION 3.8)
-         project(package_name_vendor)
-
-         find_package(ament_cmake REQUIRED)
-
-         # Option to force vendor build even if system version exists
-         option(FORCE_BUILD_VENDOR_PKG "Build from source instead of using
-         system package" OFF)
-
-         # Try to find system-installed version first
-         if(NOT FORCE_BUILD_VENDOR_PKG)
-           find_package(package_name QUIET)
-         endif()
-
-         if(package_name_FOUND)
-           message(STATUS "Found system package_name, skipping build")
-           ament_package()
-           return()
-         endif()
-
-         # Build from source using ExternalProject
-         include(ExternalProject)
-
-         ExternalProject_Add(package_name_external
-           GIT_REPOSITORY https://github.com/owner/repo.git
-           GIT_TAG v1.0.0  # Specific version/tag/commit
-
-           CMAKE_ARGS
-             -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
-             -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-             # Add other cmake options as needed
-             -DBUILD_TESTING=OFF
-             -DBUILD_EXAMPLES=OFF
-
-           # Patch if needed
-           # PATCH_COMMAND patch -p1 < ${CMAKE_CURRENT_SOURCE_DIR}/patches/fix.patch
-         )
-
-         # Install marker file so other packages know this was built
-         install(FILES
-           ${CMAKE_CURRENT_BINARY_DIR}/package_name_external-prefix/src/package_name_external-stamp/package_name_external-build
-           DESTINATION share/${PROJECT_NAME}
-         )
-
-         ament_package()
-       ```
-
-   - **Alternative: Download and Build Archive**
-
-       For non-git sources:
-
-       ```cmake
-       ExternalProject_Add(package_name_external
-         URL https://example.com/package-1.0.0.tar.gz
-         URL_HASH SHA256=abc123...
-
-         CMAKE_ARGS
-           -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
-           -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-       )
-       ```
-
-   - **For Non-CMake Projects**
-
-       If the source uses Make, Autotools, or custom build:
-
-       ```cmake
-       ExternalProject_Add(package_name_external
-         GIT_REPOSITORY https://github.com/owner/repo.git
-         GIT_TAG v1.0.0
-
-         CONFIGURE_COMMAND ./configure --prefix=${CMAKE_INSTALL_PREFIX}
-         BUILD_COMMAND make -j$(nproc)
-         INSTALL_COMMAND make install
-
-         BUILD_IN_SOURCE 1
-       )
-       ```
-
-    **Contribute to Opensource!** Now that you've create a vendor package, you can release it to the ROS buildfarm and become a co-maintainer of the package! Refer to the below steps (skip to Option B) to see how.
-
-1. **Clone the repo into the dockerfile** This is only for repos can can be built with colcon, BUT do not release themselves as part of the ROS build farm (cannot be downloaded through rosdep).
-
-    **Contribute to Opensource!** If the package can be built with colcon and its dependencies are already handled by rosdep, then you have an opportunity to become a co-maintainer of that package! To do so, do the following:
-
-    > We highly encourage this because it not only helps boosts WATonomous' reputation, but also yours in the opensource community. You also get to say that you are a co-maintainer of a package that could be really important (ie. SLAM, Bytetrack, etc.)
-
-    1. Contact the Original Authors First:
-
-         ```
-         Open an issue or discussion:
-         Title: "Interest in releasing this package to ROS build farm"
-
-         Hi! I'd like to use this package in production and would love to see
-         it
-         available via apt. Would you be open to:
-         1. Me helping release it to the jazzy distribution?
-        2. Becoming a co-maintainer to handle releases?
-
-        I'm happy to do the work with bloom and submit the PR.
-        ```
-
-    2. Wait for Response
-
-        Best case is they say yes
-       - You coordinate with them
-       - They give you push access to their repo (or a -release repo)
-       - You become a co-maintainer
-
-        No response after ~2 weeks: You can proceed independently (see below)
-
-    3. Independent Release
-
-        If they don't respond or aren't interested in maintaining:
-
-        Option A: Release from a fork
-
-        **Fork their repo to the WATonomous GitHub then release from the fork**
-
-        > **TODO (eddy)** Currently, we are trying to figure out how to do the release process for our monorepo. If you run into this, let my know
-
-        bloom-release --rosdistro jazzy --track jazzy package_name \
-          --github-org your_username
-
-        In the rosdistro PR, explain:
-        This is a release of [original_repo] maintained by [original_author].
-
-       - Original repo: https://github.com/original/repo
-       - I've reached out to the maintainer (link to issue)
-       - No response after 2 weeks / Maintainer is no longer active
-       - I'm taking on maintenance responsibility for ROS releases
-
-        Option B: **Create a vendor package**
-
-        your_org/their_package_vendor
-
-        This signals you're maintaining a vendored version.
-
-    4. Maintenance Responsibility
-
-        By releasing, WATonomous (or you) is committing to:
-       - Respond to build farm issues
-       - Update for new ROS distros
-       - Fix critical bugs (or at least coordinate fixes)
-        Add watonomous yourself to package.xml:
-
-        ```xml
-          <maintainer email="hello@watonomous.com">WATonomous</maintainer>
-          <author email="original@email.com">Original Author</author>
-        ```
+This is safe only when no ROS 2 processes are running. Do not clean `/dev/shm/*.zenoh` while containers are active.

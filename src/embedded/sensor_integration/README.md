@@ -1,1 +1,0 @@
-This folder contains information related to the embedded side of sensor integration (LiDARs, Cameras, etc).
