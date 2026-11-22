@@ -1,7 +1,0 @@
-# Request - empty
----
-# List of available scenario plugin class names
-string[] scenario_names
-
-# Human-readable descriptions
-string[] descriptions
