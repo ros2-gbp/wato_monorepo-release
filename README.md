@@ -1,51 +1,57 @@
-# WATonomous Monorepo (for EVE)
+# eidos CLI
 
-Dockerized monorepo for the WATonomous autonomous vehicle project (dubbed EVE).
+Command-line tool for inspecting and exporting eidos `.map` files. Available as `eidos` after sourcing the workspace.
 
-<div align="center">
-  <img src=".img/eve.jpg" height="250"/>
-  <img src=".img/wheel_turn_stabilized.gif" height="250">
-  <img src=".img/sensors.gif" height="250"/>
-  <img src=".img/world_model.gif" height="250"/>
-  <img src="./src/world_modeling/eidos/.img/EIDOS.gif" height="250"/>
-  <img src="./src/world_modeling/eidos/.img/reloc.gif" height="250"/>
-</div>
+## Commands
 
-## Prerequisite Installation
-These steps are to setup the monorepo to work on your own PC. We utilize docker to enable ease of reproducibility and deployability.
+### `eidos info <map_file>`
 
-> Why docker? It's so that you don't need to download any coding libraries on your bare metal pc, saving headache :3
+Print map metadata: version, keyframe count, edge count, spatial bounds, data formats, and decoded global data.
 
-1. Our monorepo infrastructure supports Linux Ubuntu >= 22.04, Windows (WSL/WSL2), and MacOS. Though, aspects of this repo might require specific hardware like NVidia GPUs.
-2. Once inside Linux, [Download Docker Engine using the `apt` repository](https://docs.docker.com/engine/install/ubuntu/#install-using-the-repository). If you are using WSL, install docker outside of WSL, it will automatically setup docker within WSL for you.
-3. You're all set! Information on running the monorepo with our infrastructure is given [here](https://wiki.watonomous.ca/autonomous_software_general/monorepo_infrastructure/)
+```bash
+eidos info /opt/watonomous/maps/wrestrc.map
+```
 
-## Large File Storage
-Some nodes require larger files like model weights and maps. Furthermore, we might want to test our codebase on bag recordings which are even larger. These files are stored in our **Google Drive** (Only accessible by WATonomous members):
-- [**Bag Recordings**](https://drive.google.com/drive/folders/127Kw3o7Org474rkK1wwMDRZKiYHaR0Db) (place inside a wato_monorepo/bags/ directory for full functionality)
-- [**Maps**](https://drive.google.com/drive/folders/19dYQiaLV9ZQ7KtriXxWlO38N4E2GCZSF) (place inside a wato_monorepo/maps/ directory for full functionality)
-  - **REQUIRED** by **world_modeling** (map elements for localization on an existing map, .osm file for HD map) (not required when running simulation)
-- [**Weights**](https://drive.google.com/drive/folders/10EXFocqX40L4JLPhppSyHl9GuhrG9wPj?usp=sharing) (place inside a wato_monorepo/weights/ directory for full funtionality)
-  - **REQUIRED** by **perception** (model weights for inference)
+### `eidos poses <map_file>`
 
-## Available Modules
+Dump keyframe poses as CSV to stdout.
 
-`Infrastructure` Starts the foxglove bridge and data streamer for rosbags.
+```bash
+eidos poses /opt/watonomous/maps/wrestrc.map > poses.csv
+```
 
-`Interfacing` Launches packages directly connecting to hardware. This includes the sensors of the car and the car itself. [see docs](src/interfacing/INTERFACING_README.md)
+Output columns: `id, gtsam_key, x, y, z, roll, pitch, yaw, time, owner`
 
-`Perception` Launches packages for perception. [see docs](src/perception/PERCEPTION_README.md)
+### `eidos map <map_file> --key <data_key> -o <output.pcd>`
 
-`World Modeling` Launches packages for world modeling. [see docs](src/world_modeling/WM_README.md)
+Build a combined world-frame point cloud from a specified keyframe data key.
 
-`Action` Launches packages for action. [see docs](src/action/ACTION_README.md)
+```bash
+# Full resolution map from LISO clouds
+eidos map /opt/watonomous/maps/wrestrc.map --key liso_factor/cloud -o map.pcd
 
-`Simulation` Launches packages CARLA simulator. [see docs](src/simulation/CARLA_README.md)
+# Downsampled map
+eidos map /opt/watonomous/maps/wrestrc.map --key liso_factor/cloud -o map_ds.pcd --voxel 0.5
 
-## System Architecture
+# Every 5th keyframe only
+eidos map /opt/watonomous/maps/wrestrc.map --key liso_factor/cloud -o map_sparse.pcd --skip 5
+```
 
-![](.img/system_arch.png)
+Supports `pcl_pcd_binary` and `small_gicp_binary` point cloud formats. If `--key` is wrong, available keys are listed in the error output.
 
-## Contribute
+| Flag | Description |
+|---|---|
+| `--key <data_key>` | Required. Keyframe data key (e.g. `liso_factor/cloud`) |
+| `-o <output.pcd>` | Required. Output PCD file path |
+| `--voxel <size>` | Voxel downsample the merged cloud (meters) |
+| `--skip <N>` | Use every Nth keyframe (default: 1) |
 
-Information on contributing to the monorepo is given in [DEVELOPING.md](./DEVELOPING.md)
+### `eidos graph <map_file>`
+
+Print factor graph edges as CSV to stdout.
+
+```bash
+eidos graph /opt/watonomous/maps/wrestrc.map
+```
+
+Output columns: `key_a, key_b, owner`
